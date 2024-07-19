@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice AI Chat</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            font-family: Arial, sans-serif;
+        }
+        #controls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 20px;
+        }
+        #startStopButton {
+            background-color: red;
+            border: none;
+            border-radius: 50%;
+            width: 100px;
+            height: 100px;
+            color: white;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        #waveform {
+            width: 100%;
+            height: 100px;
+            background-color: #f0f0f0;
+            margin: 10px 0;
+        }
+        #status {
+            font-size: 18px;
+            margin-bottom: 10px;
+            font-weight: bold;
+        }
+        #conversation {
+            width: 80%;
+            max-width: 600px;
+            margin: 20px;
+        }
+        .message {
+            padding: 10px;
+            border-bottom: 1px solid #ddd;
+        }
+        .error {
+            color: red;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>Voice AI Chat</h1>
+    <div id="controls">
+        <button id="startStopButton">Start</button>
+    </div>
+    <div id="status"></div>
+    <canvas id="waveform"></canvas>
+    <div id="conversation"></div>
+
+    <script>
+        const socket = io('http://localhost:5000');
+        const startStopButton = document.getElementById('startStopButton');
+        const statusDiv = document.getElementById('status');
+        const conversationDiv = document.getElementById('conversation');
+        const canvas = document.getElementById('waveform');
+        const canvasCtx = canvas.getContext('2d');
+
+        let isListening = false;
+        let audioContext;
+        let analyser;
+        let microphone;
+        let javascriptNode;
+        let audioChunks = [];
+        let silenceTimer;
+        let mediaRecorder;
+        let stream;
+        let manualStop = false;
+        let currentAudio;  // Variable to hold the current audio object
+
+        socket.on('connect', () => {
+            console.log('Connected to server');
+        });
+
+        socket.on('ready_for_input', () => {
+            console.log('Server is ready for input');
+            if (!manualStop) {
+                startListening();
+            }
+        });
+
+        socket.on('error', (data) => {
+            displayError(data.message);
+        });
+
+        startStopButton.addEventListener('click', toggleConversation);
+
+        async function initMicrophone() {
+            if (!stream) {
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        channelCount: 1,
+                        sampleRate: 16000,
+                        sampleSize: 16
+                    } 
+                });
+
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
+                analyser = audioContext.createAnalyser();
+                microphone = audioContext.createMediaStreamSource(stream);
+                javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
+
+                analyser.smoothingTimeConstant = 0.8;
+                analyser.fftSize = 1024;
+
+                microphone.connect(analyser);
+                analyser.connect(javascriptNode);
+                javascriptNode.connect(audioContext.destination);
+
+                javascriptNode.onaudioprocess = processAudio;
+
+                drawWaveform();
+            }
+        }
+
+        async function toggleConversation() {
+            if (isListening || startStopButton.textContent == "Stop") {
+                manualStop = true;
+                stopConversation();
+            } else {
+                startStopButton.textContent = "Stop";
+                startStopButton.style.backgroundColor = "darkred";
+                manualStop = false;
+                await initMicrophone();
+                startListening();
+            }
+        }
+
+        function startListening() {
+            if (isListening) return;
+
+            audioChunks = [];
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+
+            mediaRecorder.ondataavailable = event => {
+                if (event.data.size > 0) {
+                    audioChunks.push(event.data);
+                } else {
+                    console.error('Received an empty audio chunk.');
+                }
+            };
+
+            mediaRecorder.onstop = () => {
+                if (!manualStop) {
+                    if (audioChunks.length > 0) {
+                        sendAudioToServer();
+                    } else {
+                        console.error('No audio chunks to send to server.');
+                    }
+                } else {
+                    statusDiv.textContent = 'Stopped.';
+                }
+            };
+
+            mediaRecorder.start(); // Collect data every second
+
+            isListening = true;
+            statusDiv.textContent = 'Listening...';
+        }
+
+        function stopListening() {
+            if (!isListening) return;
+
+            isListening = false;
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+            if (silenceTimer) {
+                clearTimeout(silenceTimer);
+                silenceTimer = null;
+            }
+            if (manualStop) {
+                statusDiv.textContent = 'Stopped.';
+            }
+        }
+
+        function stopConversation() {
+            startStopButton.textContent = "Start";
+            startStopButton.style.backgroundColor = "red";
+            if (manualStop) {
+                statusDiv.textContent = 'Stopped.';
+            }
+            stopListening();
+
+            // Ensure all components are stopped and reset
+            if (javascriptNode) {
+                javascriptNode.disconnect();
+                javascriptNode.onaudioprocess = null;
+            }
+            if (analyser) {
+                analyser.disconnect();
+            }
+            if (microphone) {
+                microphone.disconnect();
+            }
+            if (audioContext && audioContext.state !== 'closed') {
+                audioContext.close();
+            }
+
+            // Stop current audio playback if any
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio = null;
+            }
+
+            // Reset stream and recording states
+            stream = null;
+            isListening = false;
+        }
+
+        function processAudio() {
+            if (manualStop) return;  
+            const array = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(array);
+
+            const values = array.reduce((a, b) => a + b, 0) / array.length;
+
+            if (values > 5) {  // Adjust this threshold as needed
+                if (silenceTimer) clearTimeout(silenceTimer);
+                silenceTimer = setTimeout(() => {
+                    // manualStop = false;
+                    stopListening();
+                    if (audioChunks.length > 0) {
+                        sendAudioToServer();
+                    }
+                }, 1500);  // Adjust this delay as needed
+            }
+        }
+
+        function drawWaveform() {
+            requestAnimationFrame(drawWaveform);
+
+            const array = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteTimeDomainData(array);
+
+            canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Create gradient
+            const gradient = canvasCtx.createLinearGradient(0, 0, canvas.width, 0);
+            gradient.addColorStop(0, 'cyan');
+            gradient.addColorStop(0.5, 'magenta');
+            gradient.addColorStop(1, 'blue');
+
+            canvasCtx.lineWidth = 2;
+            canvasCtx.strokeStyle = gradient;
+
+            canvasCtx.beginPath();
+
+            const sliceWidth = canvas.width * 1.0 / analyser.frequencyBinCount;
+            let x = 0;
+
+            for (let i = 0; i < analyser.frequencyBinCount; i++) {
+                const v = array[i] / 128.0;
+                const y = v * canvas.height / 2;
+
+                if (i === 0) {
+                    canvasCtx.moveTo(x, y);
+                } else {
+                    canvasCtx.lineTo(x, y);
+                }
+
+                x += sliceWidth;
+            }
+
+            canvasCtx.lineTo(canvas.width, canvas.height / 2);
+            canvasCtx.stroke();
+        }
+
+
+        function sendAudioToServer() {
+            if (audioChunks.length === 0) {
+                console.error('No audio chunks available for sending.');
+                return;
+            }
+
+            const audioBlob = new Blob(audioChunks, { type: 'audio/webm;codecs=opus' });
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                if (manualStop) {
+                    statusDiv.textContent = 'Stopped.';
+                } else {
+                    const base64Audio = reader.result.split(',')[1];
+                    console.log('Sending audio chunk, size:', base64Audio.length);
+                    socket.emit('audio_stream', { audio: base64Audio });
+                    if (manualStop) {
+                        statusDiv.textContent = 'Stopped.';
+                    } else {
+                        statusDiv.textContent = 'Thinking...';
+                    }
+                }
+
+            };
+            reader.onerror = (error) => {
+                console.error('Error reading audio blob:', error);
+            };
+            reader.readAsDataURL(audioBlob);
+            audioChunks = [];
+        }
+
+
+        function displayMessage(sender, message) {
+            const messageElement = document.createElement('div');
+            messageElement.className = 'message';
+            messageElement.textContent = `${sender}: ${message}`;
+            conversationDiv.appendChild(messageElement);
+        }
+
+        function displayError(message) {
+            const errorElement = document.createElement('div');
+            errorElement.className = 'message error';
+            errorElement.textContent = `Error: ${message}`;
+            conversationDiv.appendChild(errorElement);
+        }
+
+        function playAudioResponse(audioData) {
+            console.log('Attempting to play audio response, length:', audioData.length);
+            const audio = new Audio('data:audio/wav;base64,' + audioData);
+            currentAudio = audio;  // Save reference to current audio object
+            audio.onloadedmetadata = () => {
+                console.log('Audio metadata loaded:', audio.duration, 'seconds');
+            };
+            audio.onended = () => {
+                console.log('Audio playback ended');
+                if (!manualStop) {
+                    statusDiv.textContent = 'Listening...';
+                }
+            };
+            audio.onerror = (e) => {
+                console.error('Audio playback error:', e);
+            };
+            audio.play().then(() => {
+                console.log('Audio playback started');
+                statusDiv.textContent = 'Responding...';
+            }).catch(e => {
+                console.error('Error playing audio:', e);
+            });
+        }
+
+        socket.on('response', (data) => {
+            console.log('Received response from server:', data);
+            if (manualStop) return;
+            displayMessage('You', data.text);
+            displayMessage('AI', data.llm_response);
+            if (data.audio) {
+                console.log('Audio data received, length:', data.audio.length);
+                playAudioResponse(data.audio);
+            } else {
+                console.warn('No audio data received in response');
+                statusDiv.textContent = 'Listening...';
+            }
+        });
+    </script>
+</body>
+</html>
